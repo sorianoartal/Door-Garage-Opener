@@ -1,12 +1,25 @@
 #include "SPI/SPIBus.h"
+#include "Config/CC1101_Config/CC1101.h"
 #include "utils/HelperFunc.h"
+
+namespace {
+String registerLabel(uint8_t address)
+{
+    return String(CC1101::registerName(address)) + String(F(" (")) + formatHex8(address) + ')';
+}
+
+String attemptLabel(uint8_t attempt, uint8_t total = 3)
+{
+    return String(attempt) + "/" + String(total);
+}
+} // namespace
 
 
 /// @brief SPIBus constructor
 /// @param csnPin Pin for Chip Select (active low). Enables/disables the device for SPI communication.
 /// @param clockSpeed Clock speed (Hz) for SPI communication (default: 1 MHz).
 /// @param bitOrder Data bit order: MSBFIRST or LSBFIRST (default: MSBFIRST).
-/// @param spiMode SPI mode (0–3) for clock phase and polarity (default: SPI_MODE0).
+/// @param spiMode SPI mode (0-3) for clock phase and polarity (default: SPI_MODE0).
 SPIBus::SPIBus(uint8_t csnPin, uint32_t clockSpeed, uint8_t bitOrder, uint8_t spiMode):
 _csnPin(csnPin),
 _settings(clockSpeed, bitOrder,spiMode)
@@ -16,21 +29,42 @@ _settings(clockSpeed, bitOrder,spiMode)
 /// @brief Initialize the SPI bus to ensures the SPI bus is ready and the CC1101 is deselected by default.
 void SPIBus::begin()
 {
-    pinMode(_csnPin,OUTPUT);                                        // Configure CSn pin as output
-    deselectDevice();                                                       // Deselect device as default state
-    SPI.begin();                                                               // Initialize SPI 
+    pinMode(_csnPin,OUTPUT);
+    deselectDevice();
+    SPI.begin();
+}
+
+void SPIBus::beginBus()
+{
+    SPI.beginTransaction(_settings);
+}
+
+void SPIBus::endBus()
+{
+    SPI.endTransaction();
 }
 
 /// @brief Set CSn pin LOW to select the device.
 void SPIBus::selectDevice()
-{   
-    digitalWrite(_csnPin,LOW);                                           // Enable device to be ready for receiving data   
+{
+    digitalWrite(_csnPin,LOW);
 }
 
 /// @brief Set CSn pin HIGH to deselect the device.
 void SPIBus::deselectDevice()
-{ 
-    digitalWrite(_csnPin,HIGH);                                           // Disable Slave device from SPI bus  
+{
+    digitalWrite(_csnPin,HIGH);
+}
+
+bool SPIBus::waitUntilReady(uint16_t timeoutUs) const
+{
+    unsigned long start = micros();
+    while (digitalRead(MISO) == HIGH) {
+        if (static_cast<unsigned long>(micros() - start) > timeoutUs) {
+            return false;
+        }
+    }
+    return true;
 }
 
 
@@ -39,23 +73,24 @@ void SPIBus::deselectDevice()
 /// @return Status byte
 uint8_t SPIBus::transferByte(uint8_t data)
 {
-    // To store the received data after the SPI transfer
-    uint8_t receivedData;
-    
-    // Apply SPI transaction
-    applyTransaction([&](){ receivedData = SPI.transfer(data);});
-    
-    // Log the transfer operation
+    uint8_t receivedData = 0xFF;
+
+    if (!applyTransaction([&](){ receivedData = SPI.transfer(data); })) {
+        LOG_NEW_LINE("[SPI][BYTE][ERROR] Timed out waiting for CC1101 ready");
+        return 0xFF;
+    }
+
     #if LOG_VERBOSE
-        LOG("SPIBus::transferByte - Single byte transfer");
-        printDots(3, 500); // Print 3 dots with a 500 ms delay between each dot
-        LOG_PAIR_HEX("Sent: ", data);
-        LOG_PAIR_HEX("Received: ", receivedData);
-         LOG("\n");
+    LOG_DYNAMIC(String(F("[SPI][BYTE] TX ")) + formatHex8(data) +
+                String(F(", RX ")) + formatHex8(receivedData));
     #endif
 
-    // Return the received data
     return receivedData;
+}
+
+uint8_t SPIBus::transferRaw(uint8_t data)
+{
+    return SPI.transfer(data);
 }
 
 
@@ -64,36 +99,38 @@ uint8_t SPIBus::transferByte(uint8_t data)
 /// @param data - Data Buffer to write
 /// @param length - Number of bytes to write( for the CC1101 FIFO max. 64bytes)
 bool SPIBus::writeBurstRegister(uint8_t address, const uint8_t *data, size_t length)
-{   
-    // Validate parameters
-    if (!data || length == 0 || length>64)
+{
+    if (!data || length == 0 || length > 64)
     {
-        LOG_NEW_LINE("writeBurstRegister Error : Invalid parameters");
-        LOG_PAIR_HEX("Address: ", address);
-        LOG_PAIR_HEX("Length: ", length);
-        return false;
-    }
-    
-    // Validate address
-    if(address != 0x03 && address != 0x3F)
-    {
-        LOG_NEW_LINE("writeBurstRegister Error : Invalid address ");
-        LOG_PAIR_HEX("Address: ", address);
+        LOG_DYNAMIC(String(F("[SPI][BURST-WRITE][ERROR] Invalid parameters for ")) +
+                    registerLabel(address) + String(F(", length=")) + String(length));
         return false;
     }
 
-    // Sends the address followed by data bytes in a loop.
-    applyTransaction( [&]()
-        {
-            SPI.transfer(address | bitFlags::writeBurstRegister);                                                                   // bitFlags::writeBurstRegister (0x40) to set bit 6 for burst write mode
-            for (size_t i = 0; i < length; i++) {
-                SPI.transfer(data[i]);
-            }
-        });
+    if (address > bitFlags::AddressMask)
+    {
+        LOG_DYNAMIC(String(F("[SPI][BURST-WRITE][ERROR] Invalid address ")) + formatHex8(address));
+        return false;
+    }
 
-      LOG("\n\n");
+    #if LOG_VERBOSE
+    LOG_DYNAMIC(String(F("[SPI][BURST-WRITE] ")) + registerLabel(address) +
+                String(F(", length=")) + String(length));
+    #endif
 
-   return true; // Success
+    if (!applyTransaction([&]()
+    {
+        SPI.transfer(address | bitFlags::writeBurstRegister);
+        for (size_t i = 0; i < length; i++) {
+            SPI.transfer(data[i]);
+        }
+    })) {
+        LOG_DYNAMIC(String(F("[SPI][BURST-WRITE][ERROR] Timeout while writing ")) + registerLabel(address));
+        return false;
+    }
+
+    LOG("\n\n");
+    return true;
 }
 
 /// @brief Read Multiple bytes from an address
@@ -102,48 +139,40 @@ bool SPIBus::writeBurstRegister(uint8_t address, const uint8_t *data, size_t len
 /// @param length - Number of byte to read( max. 64 for the  CC1101)10
 bool SPIBus::readBurstRegister(uint8_t address, uint8_t *buffer, size_t length)
 {
-    uint8_t attempts = 0;                                                                                                      // Initialize attempts counter   
+    uint8_t attempts = 0;
+    bool success = false;
 
-   // Step1: Validate parameters
-   // The function checks if the address is valid, the buffer is not null, and the length is within the valid range (1 to 64 bytes).
-   // If any of these conditions are not met, the function returns false.
-   if (!validateParameters(address, buffer, length)) {
-      LOG_NEW_LINE("readBurstRegister Error : Invalid parameters");
-      LOG_PAIR_HEX("Address: ", address);
-      LOG_PAIR_HEX("Length: ", length);
-      return true; // Retry
-   }
+    if (!validateParameters(address, buffer, length)) {
+        LOG_DYNAMIC(String(F("[SPI][BURST-READ][ERROR] Invalid parameters for ")) +
+                    registerLabel(address) + String(F(", length=")) + String(length));
+        return false;
+    }
 
-    // Step2: Retry mechanism for burst read
-    // The function attempts to read the burst register up to 3 times, checking if the read was successful each time.
     avr_algorithms::repeat_withExitCondition(3, [&]()
-    {      
-        // Step3: Perform burst read operation
-        if(performBurstRead(address, buffer, length))
+    {
+        if (performBurstRead(address, buffer, length))
         {
-            LOG_NEW_LINE("SPIBus::readBurstRegister - Burst read successful");
-            LOG_PAIR_HEX("Address: ", address);
-            LOG_PAIR_HEX("Length: ", length);
-            return false; // Exit condition: success
+            #if LOG_VERBOSE
+            LOG_DYNAMIC(String(F("[SPI][BURST-READ][OK] ")) + registerLabel(address) +
+                        String(F(", length=")) + String(length));
+            #endif
+            success = true;
+            return false;
         }
-        else
-        {
-            // Step4: Log error and retry
-            String err = "SPIBus::readBurstRegister - Burst read failed at address 0x" + String(address, HEX) + ", attempt:  " + String(attempts);
-            LOG_DYNAMIC(err);
-            attempts++;
-            return true; // Retry
-        }
-   });
 
-   LOG("\n\n");
+        LOG_DYNAMIC(String(F("[SPI][BURST-READ][RETRY ")) + attemptLabel(attempts + 1) +
+                    String(F("] ")) + registerLabel(address) +
+                    String(F(", length=")) + String(length));
+        attempts++;
+        return true;
+    });
 
-   // If we reach here, it means all retries failed
-   return false;                                                                                                         // Return false to indicate failure after 3 attempts
+    LOG("\n\n");
+    return success;
 }
 
 /// @brief Writes a value to a CC1101 register over SPI
-/// Sends the register address and value using SPI transfer, with chip-select 
+/// Sends the register address and value using SPI transfer, with chip-select
 /// toggling and proper transaction wrapping.
 ///
 /// @param address - Register address : CC1101 register address (0x00 to 0x3F)
@@ -151,59 +180,48 @@ bool SPIBus::readBurstRegister(uint8_t address, uint8_t *buffer, size_t length)
 /// @return true if reg was correctly write
 bool SPIBus::writeRegister(uint8_t address, uint8_t value)
 {
-    ReadResult readResult;                                                                                                     // Initialize ReadResult to store status and value
-    uint8_t attempts = 0;                                                                                                        // Initialize attempts counter
+    uint8_t attempts = 0;
+    String label = registerLabel(address);
 
-    // Step 1: Validate address
-    // Validate address range and log error if invalid
-    // The CC1101 register address must be within the range 0x00 to 0x3F (0 to 63 in decimal).
-    // If the address is outside this range, the function logs an error message and returns false    
-    // This validation ensures that the address is a valid CC1101 register address before attempting to write to it.
-    if(address > bitFlags::AddressMask)
+    if (address > 0x2F)
     {
-      LOG("---------- SPIBus communication Error ---------");
-      LOG_NEW_LINE("SPIBus::writeRegister Error: Invalid CC1101 register address");
-      LOG_PAIR_HEX("Address: ", address);
-      return false;                                                                                                                         // Validates address against bitFlags::AddressMask (0x3F) to ensure it’s a valid CC1101 register address (0x00–0x3F).
+        LOG_DYNAMIC(String(F("[SPI][WRITE][ERROR] Invalid configuration register address ")) +
+                    formatHex8(address));
+        return false;
     }
 
-    // Step 2: Retry mechanism for writing the register
-    // The function attempts to write the register up to 3 times, checking if the write was successful each time.
-    // If the write is successful, it returns true. If not, it logs an error message and retries up to 3 times.
-    avr_algorithms::repeat_withExitCondition(3,[&]()
-    {
-        // Perform SPI write transaction
-        applyTransaction([&]()
-        {
-            SPI.transfer(address & bitFlags::WriteSingle);                                                                      // bitFlags::WriteSingle (0x7F) to clear bit 7 for single-byte write mode (e.g., 0x02 & 0x7F = 0x02 for IOCFG0)
-            SPI.transfer(value);
-        });
+    #if LOG_VERBOSE
+    LOG_DYNAMIC(String(F("[SPI][WRITE] ")) + label + String(F(" <= ")) + formatHex8(value));
+    #endif
 
-        // Step 3: Read back to verify success  
-        readResult = readRegister(address);                                                                                  // Read the register to verify the write operation
-        if(readResult.isValid() && readResult.value == value)                                                           // Check if the read value matches the written value   
+    avr_algorithms::repeat_withExitCondition(3, [&]()
+    {
+        if (applyTransaction([&]()
         {
-            LOG_NEW_LINE("SPIBus::writeRegister - Write operation successful");
-            LOG_PAIR_HEX("Address: ", address);
-            LOG_PAIR_HEX("Value: ", value);
-            return false; // Exit condition: success
+            SPI.transfer(address & bitFlags::WriteSingle);
+            SPI.transfer(value);
+        })) {
+            #if LOG_VERBOSE
+            LOG_DYNAMIC(String(F("[SPI][WRITE][OK] ")) + label +
+                        String(F(" <= ")) + formatHex8(value));
+            #endif
+            return false;
         }
-        else
-        {
-            // Step 4: Log if verification fails
-            String err = "Register write mismatch at 0x" + String(address, HEX)
-                + ". Expected: 0x" + String(value, HEX)
-                + ", Read: 0x" + String(readResult.value, HEX);
-            LOG_DYNAMIC(err);
-            attempts++;       // Increment attempts counter
-            return true;         // Retry
-        }
+
+        LOG_DYNAMIC(String(F("[SPI][WRITE][RETRY ")) + attemptLabel(attempts + 1) +
+                    String(F("] ")) + label +
+                    String(F(": timeout waiting for CC1101 ready")));
+        attempts++;
+        return true;
     });
 
-   // If we reach here, it means all retries failed
-   LOG_NEW_LINE("SPIBus::writeRegister Error: Failed to write register after 3 attempts");  
-   LOG("\n\n");
-   return false;    
+    if (attempts < 3) {
+        return true;
+    }
+
+    LOG_DYNAMIC(String(F("[SPI][WRITE][ERROR] Failed to program ")) + label + F(" after 3 attempts"));
+    LOG("\n\n");
+    return false;
 }
 
 
@@ -216,54 +234,57 @@ bool SPIBus::writeRegister(uint8_t address, uint8_t value)
 ReadResult SPIBus::readRegister(uint8_t address)
 {
     ReadResult result(0xFF, 0xFF);
+    String label = registerLabel(address);
 
-    // Step 1: Validate address (immediate exit if invalid)
     if (address > bitFlags::AddressMask) {
-        LOG_NEW_LINE("SPIBus::readRegister Error: Invalid CC1101 register address");
-        LOG_PAIR_HEX("Address: ", address);
+        LOG_DYNAMIC(String(F("[SPI][READ][ERROR] Invalid CC1101 register address ")) +
+                    formatHex8(address));
         return result;
     }
 
     uint8_t attempts = 0;
 
-    String msg = "SPIBus::readRegister - Attempting to read register 0x" + String(address,HEX) ;
-    LOG_DYNAMIC(msg);
-    printDots(3, 500); // Print 3 dots with a 500 ms delay between each dot
+    #if LOG_VERBOSE
+    LOG_DYNAMIC(String(F("[SPI][READ] Request ")) + label);
+    #endif
 
-
-    // Read retry mechanism
     avr_algorithms::repeat_withExitCondition(3, [&]() {
-        applyTransaction([&]() {      
-            result.status = SPI.transfer(address | bitFlags::ReadSingle);
+        uint8_t header = (address >= 0x30) ? static_cast<uint8_t>(address | bitFlags::readBurstRegister)
+                                           : static_cast<uint8_t>(address | bitFlags::ReadSingle);
+
+        if (!applyTransaction([&]() {
+            result.status = SPI.transfer(header);
             result.value  = SPI.transfer(bitFlags::DummyByte);
-
-            #if LOG_VERBOSE
-                LOG_NEW_LINE("SPIBus::readRegister - Read operation");
-                LOG_PAIR_HEX("Address: ", address);
-                LOG_PAIR_HEX("Status: ", result.status);
-                LOG_PAIR_HEX("Value: ", result.value);
-            #endif   
-            return false; // Transaction succeeded, exit retry loop
-        });
-
-        if (!result.isValid()) {
-            LOG_NEW_LINE("SPIBus::readRegister Error: Invalid status byte (0xFF) or value (0xFF)");
-            String errorMsg = "Attempt " + String(attempts + 1) + " failed.";
+        })) {
+            LOG_DYNAMIC(String(F("[SPI][READ][RETRY ")) + attemptLabel(attempts + 1) +
+                        String(F("] ")) + label +
+                        String(F(" timed out waiting for CC1101 ready")));
             delayMicroseconds(100);
-            LOG_DYNAMIC(errorMsg);
-            LOG("Retrying");
-            printDots(3, 1000); // Print 3 dots with a 500 ms delay between each dot
-            LOG("\n");
-
-            attempts++; // Only increment on retry
-            return true; // Retry
+            attempts++;
+            return true;
         }
 
-        return false; // Success, exit loop
+        #if LOG_VERBOSE
+        LOG_DYNAMIC(String(F("[SPI][READ][OK] ")) + label +
+                    String(F(" -> value ")) + formatHex8(result.value) +
+                    String(F(", status ")) + formatHex8(result.status));
+        #endif
+
+        if (!result.isValid()) {
+            LOG_DYNAMIC(String(F("[SPI][READ][RETRY ")) + attemptLabel(attempts + 1) +
+                        String(F("] ")) + label +
+                        String(F(" returned invalid response (status ")) + formatHex8(result.status) +
+                        String(F(", value ")) + formatHex8(result.value) + ')');
+            delayMicroseconds(100);
+            attempts++;
+            return true;
+        }
+
+        return false;
     });
 
     if (!result.isValid()) {
-        LOG_NEW_LINE("SPIBus::readRegister Error: Failed to read register after 3 attempts");
+        LOG_DYNAMIC(String(F("[SPI][READ][ERROR] Failed to read ")) + label + F(" after 3 attempts"));
         LOG("\n\n");
     }
     return result;
@@ -288,12 +309,12 @@ bool SPIBus::validateParameters(uint8_t address, const uint8_t *buffer, size_t l
      // Step1: Validate parameters
     // Check if the address is valid, the buffer is not null, and the length is within the valid range (1 to 64 bytes).
     // If any of these conditions are not met, the function returns false.
-    if(length > 64 ) return false;                                                                                                    
+    if(length == 0 || length > 64 ) return false;                                                                                                    
     
     // Step2: Validate address
     // The CC1101 register address must be within the range 0x00 to 0x3F (0 to 63 in decimal).
     // If the address is outside this range, the function returns false.
-    if ((address & bitFlags::AddressMask) > bitFlags::AddressMask) return false ;                          
+    if (address > bitFlags::AddressMask) return false ;                          
 
     // Step3: Validate buffer
     // Check if the buffer is not null. If it is null, the function returns false
@@ -334,13 +355,15 @@ bool SPIBus::performBurstRead(uint8_t address, uint8_t *buffer, size_t length)
     // The function iterates over the buffer and checks if all bytes read are 0xFF.
     // If any byte is not 0xFF, the allFFs flag is set to false, indicating that the read operation was successful and data was read into the buffer.
     // If all bytes are 0xFF, it indicates a likely SPI read failure,
-    applyTransaction([&]() {
+    if (!applyTransaction([&]() {
         SPI.transfer(address | bitFlags::readBurstRegister);
         avr_algorithms::for_each(buffer, length, [&](uint8_t& data, uint8_t index) {
             data = SPI.transfer(bitFlags::DummyByte);
             if (data != 0xFF) allFFs = false;
         });
-    });
+    })) {
+        return false;
+    }
 
     // Return true if not all bytes are 0xFF, indicating a successful read operation
     return (allFFs) ? false : true;  

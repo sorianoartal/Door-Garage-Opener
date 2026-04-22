@@ -22,12 +22,16 @@ CircularDebounceBuffer::CircularDebounceBuffer(
   _debouncing(false),
   _stableState(false),
   _pressedDetected(false),
+  _startRequested(false),
   _head(0),
   _thresholdPercentage(90),                         // default to 90% (you can override in setup)
   _callbackCounter(0),
   _delayBetweenSamples(delayBetweenUs)  // initialize Delay with desired interval
 {
     clearBuffer();
+    for (size_t i = 0; i < MAX_CALLBACKS; ++i) {
+        _callbacks[i] = nullptr;
+    }
 }
 
 /**
@@ -39,6 +43,15 @@ void CircularDebounceBuffer::clearBuffer()
         _buffer[i] = false;
     }
     _head = 0;
+}
+
+void CircularDebounceBuffer::beginDebounceSession()
+{
+    _debouncing      = true;
+    _pressedDetected = false;
+    _startRequested  = false;
+    clearBuffer();
+    _delayBetweenSamples.restartTimer();
 }
 
 /**
@@ -77,12 +90,9 @@ void CircularDebounceBuffer::addCallback(Callback cb)
  */
 void CircularDebounceBuffer::startDebounce()
 {
-    // Only arm if we’re not already debouncing AND the last stable state is “not pressed.”
-    if (!_debouncing && !_stableState) {
-        _debouncing      = true;
-        _pressedDetected = false;                   // allow the next “press” to fire a callback
-        clearBuffer();                                      // drop any old samples
-        _delayBetweenSamples.restartTimer();  // begin counting from now
+    // Keep the ISR work minimal and let update() start the timer safely in the main loop.
+    if (!_stableState) {
+        _startRequested = true;
     }
 }
 
@@ -99,6 +109,14 @@ void CircularDebounceBuffer::startDebounce()
  */
 void CircularDebounceBuffer::update()
 {
+    bool rawNow      = digitalRead(_pin);
+    bool adjustedNow = _isActiveLow ? !rawNow : rawNow;
+
+    // Start a new debounce session either from the ISR request or from direct polling.
+    if (!_debouncing && !_stableState && (_startRequested || adjustedNow)) {
+        beginDebounceSession();
+    }
+
     // 1) If not currently in a debouncing session, do nothing
     if (!_debouncing) {
         return;
@@ -116,8 +134,7 @@ void CircularDebounceBuffer::update()
     //    We can safely proceed to read the pin and insert into buffer.
 
     // 4) Read raw pin, normalize for active‐LOW/high, and write into buffer
-    bool raw      = digitalRead(_pin);
-    bool adjusted = _isActiveLow ? !raw : raw;
+    bool adjusted = adjustedNow;
     _buffer[_head] = adjusted;
     _head = (size_t)((_head + 1) % BUFFER_SIZE);
 
@@ -150,6 +167,11 @@ void CircularDebounceBuffer::update()
 
             // We do NOT clear or disarm yet; we stay debouncing
             // so that we can detect the release later.
+        } else if (!adjusted && trueCount == 0) {
+            // The line returned to idle before we ever confirmed a valid press.
+            clearBuffer();
+            _debouncing = false;
+            _startRequested = false;
         }
         // Return immediately; wait until the next sample interval to proceed.
         return;
@@ -194,5 +216,9 @@ void CircularDebounceBuffer::reset()
     _stableState     = false;
     _pressedDetected = false;
     _debouncing      = false;
+    _startRequested  = false;
     _callbackCounter = 0;
+    for (size_t i = 0; i < MAX_CALLBACKS; ++i) {
+        _callbacks[i] = nullptr;
+    }
 }

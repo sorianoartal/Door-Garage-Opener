@@ -17,20 +17,22 @@
 
 // Global state flag
 volatile bool buttonFlag = false;
+bool transceiverReady = false;
 
 // Timing for periodic status updates
 unsigned long lastTimeSend = 0;
 constexpr uint16_t SEND_INTERVAL = 1000;
 
-// SPI instance for CC1101 communication
-SPIBus spiBus(CSN_PIN);
+// SPI instance for CC1101 communication.
+// Use a conservative SPI clock during bring-up to tolerate marginal wiring.
+SPIBus spiBus(CSN_PIN, 100000);
 
-// CC1101 Transceiver configuration  (315 MHz, OOK, high power)
+// CC1101 Transceiver configuration  (331 MHz, OOK, high power)
 TransceiverConfig config
 (
-FREQ_315MHZ_BAND,                                                         
+FREQ_331MHZ_BAND,                                                         
 ModulationScheme::OOK,                                                   
-OutputPowerLevels::HIGH_POWER                                       
+OutputPowerLevel::HIGH_POWER                                       
 );
 
 // SC41344 encoder for generating RF signal on GDO0 pin
@@ -92,7 +94,7 @@ void onButtonPressed();
 
 void setup() {
 
-   // Initialize Serial Communication
+  // Initialize Serial Communication
   Serial.begin(115200);
   delay(250);                                                                                                             // Stabilize serial                    
  
@@ -102,17 +104,23 @@ void setup() {
 
   // Initialize CC1101 Transceiver
   LOG("System Booting");
-  printDots(3,1000);                                                                                              // Print 3 dots with a 1000 ms delay between each dot
-
-  if (! transceiver.begin())
+  printDots(3,1000);    
+  
+  transceiverReady = transceiver.begin();
+  if (!transceiverReady)
   {
     LOG_NEW_LINE("Transceiver initialization failed");
   }
   else
   {
     LOG_NEW_LINE("Transceiver initialized successfully");
-  }
 
+    // Configure the MCU-side GDO0 driver only after the CC1101 has been
+    // programmed to leave GDO0 in a safe non-TX state.
+    encoder.begin();
+    LOG_NEW_LINE("Encoder initialized");
+  }
+  
   // Configure button pin with pull-up resistor
   pinMode(BUTTON_HOME_DOOR_GARAGE_PIN, INPUT_PULLUP);
   
@@ -127,12 +135,14 @@ void setup() {
   debounce.setThreshold(THRESHOLD_DEBOUNCE);                                                                                             
   debounce.addCallback(onButtonPressed);
   
-  // Initialization encoder
-  encoder.begin();
-  LOG_NEW_LINE("Encoder initialized");
+  
 
   // Verify PA_TABLE configuration
-  printPATable();
+  if (transceiverReady) {
+    printPATable();
+  } else {
+    LOG_NEW_LINE("Skipping PATABLE read because transceiver is not initialized");
+  }
 
   // Enable interrupts
   interrupts();
@@ -163,7 +173,7 @@ void loop() {
   
   // Print CC1101 status every second
   unsigned long currentTime = millis();
-  if (currentTime - lastTimeSend >= SEND_INTERVAL)
+  if (transceiverReady && currentTime - lastTimeSend >= SEND_INTERVAL)
   {
      StatusInfo status = Transceiver::decodeStatus( 
       transceiver.readRegister(CC1101::Address::MARCSTATE)
@@ -209,6 +219,14 @@ void onButtonPressed()
 {      
   LOG_NEW_LINE("Button pressed → transmitting");
 
+  // For debugging purposes, we can directly call the static method to stream the frame without needing an instance of SC41344_FrameStreamer. 
+  // SC41344_FrameStreamer<8>::streamFrameStatic(REMOTE1_OPEN_DOOR_CODE, encoder);
+
+  if (!transceiverReady) {
+    LOG_NEW_LINE("Button pressed, but transceiver is not initialized");
+    return;
+  }
+
   // Disable interrupts for a timing-critical section
   noInterrupts();                                                                                                          
   
@@ -225,8 +243,6 @@ void onButtonPressed()
   {
    LOG_NEW_LINE("Transmission failed");
   }
-
-
 
   // Reenable watchDog
   wdt_enable(WDTO_8S);                                                                                                

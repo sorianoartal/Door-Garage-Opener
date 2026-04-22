@@ -23,7 +23,7 @@ bool Transceiver::begin()
 {
    #ifdef LOG_VERBOSE
      LOG("Transceiver::begin() - Initializing CC1101 Transceiver");
-     printDots(5, 750); // Print 5 dots with a 500 ms delay between each dot
+     printDots(3, 750); // Print 5 dots with a 500 ms delay between each dot
    #endif 
     
     // Step1: Initialize the SPI
@@ -35,10 +35,14 @@ bool Transceiver::begin()
 
 
     // Step2: Reset Transceiver
-    reset();
+    if (!reset()) {
+        LOG_NEW_LINE("Error: CC1101 reset sequence failed");
+        return false;
+    }
 
    #ifdef LOG_VERBOSE  
     LOG_NEW_LINE("Transceiver reset complete.");
+    LOG_NEW_LINE("");
     #endif
 
     // Step3: Apply Register Configuration
@@ -52,17 +56,26 @@ bool Transceiver::begin()
         return _spi.readRegister(addr).value;  // Ignore status for config verification
     };
 
-    applyRegisterConfig_CC1101<RAMStoragePolicy>(
-        Config_315MHz_OOK::setting_Regs.data(),
-        Config_315MHz_OOK::setting_Regs.size(),
+    if (!applyRegisterConfig_CC1101<RAMStoragePolicy>(
+        Config_LowBand_OOK::setting_Regs.data(),
+        Config_LowBand_OOK::setting_Regs.size(),
         writeLambda,
         readLambda
-    );
+    )) {
+        LOG_NEW_LINE("Error: Failed to apply CC1101 register configuration");
+        return false;
+    }
 
-    // Step4: Configure PATABLE
-    configurePATable(_transceiver_config.getPATableIndex());
+    // Step4: Override the base profile with the caller-selected carrier frequency.
+    setFrequency(_transceiver_config.getFrequencyHz());
 
-    // Step5 : Check if CC1101 is responsive after configuration verifying PARTNUM & VERSION  
+    // Step5: Configure PATABLE
+    if (!configurePATable(_transceiver_config.getOOKLogicOnePowerByte())) {
+        LOG_NEW_LINE("Error: Failed to configure CC1101 PATABLE");
+        return false;
+    }
+
+    // Step6 : Check if CC1101 is responsive after configuration verifying PARTNUM & VERSION  
     bool success = false;
     avr_algorithms::repeat_withExitCondition(3,[&](){
         // PARTNUM == 0x00, it indicates the CC1101 is powered, connected, and responsive to SPI
@@ -74,8 +87,9 @@ bool Transceiver::begin()
             return true;    // Retry
         }
   
-         // VERSION register at 0x30 address after reset should read 0x14 HEX  
-        if (readRegister(CC1101::Address::VERSION).value != 0x14)
+        // TI notes that valid CC1101 silicon can report VERSION as 0x04 or 0x14.
+        uint8_t version = readRegister(CC1101::Address::VERSION).value;
+        if (version != 0x04 && version != 0x14)
         {
             LOG_NEW_LINE("------ SPI communication Error   ------");
             LOG_NEW_LINE(" Error: apply configuration of CC1101 failed in Transceiver::begin() ");
@@ -107,7 +121,7 @@ bool Transceiver::begin()
 ///     - Sends STX via strobeCommand.
 ///     - Verifies MARCSTATE = 0x13 (TX) after STX.
 ///     - Logs errors for debugging.
- void Transceiver::enableTransmitMode()
+ bool Transceiver::enableTransmitMode()
 {
     using Strobe = CC1101::Strobes::Command;
     bool success = false;
@@ -126,7 +140,7 @@ bool Transceiver::begin()
         });
         if (!success) {
             LOG_DYNAMIC(error);
-            return;
+            return false;
         }
     }
 
@@ -147,6 +161,7 @@ bool Transceiver::begin()
 
     LOG_DYNAMIC(error);
     LOG("\n\n");
+    return success;
 }
 
 /**
@@ -161,73 +176,11 @@ bool Transceiver::begin()
 *      Step7 :  Wait for the chip to stabilize (typically 10 ms, as the crystal oscillator restarts).  
 *      Step8 : Verify if PARTNUM(address 0x30) == 0x00   after reset
  */
-void Transceiver::reset()
+bool Transceiver::reset()
 {
-    // Retry attempts for reset sequence
-    // This will attempt the reset sequence up to 3 times, exiting early if successful.
-    uint8_t attempt = 0; 
+    bool success = false;
+    uint8_t attempt = 0;
 
-
-    /*  
-        // The following code is commented out as it is a legacy implementation.
-        // The new implementation uses the SPIBus class for better abstraction and error handling.  
-     for (int attempts = 0; attempts < 3; attempts++) {
-        // 1. Pull CSn LOW for >10us
-        digitalWrite(CSN_PIN, LOW);
-        delayMicroseconds(10);
-
-        // 2. Pull CSn HIGH for >40us
-        digitalWrite(CSN_PIN, HIGH);
-        delayMicroseconds(40);
-
-        // 3. Pull CSn LOW to start SPI
-        digitalWrite(CSN_PIN, LOW);
-
-        // 4. Wait for MISO to go LOW (chip ready)
-        unsigned long start = millis();
-        while (digitalRead(MISO) == HIGH) {
-            if (millis() - start > 100) {
-                LOG_NEW_LINE("Timeout waiting for MISO LOW before SRES");
-                break;
-            }
-        }
-
-        // 5. Send SRES (while CSn is still LOW!)
-        SPI.beginTransaction(SPISettings(500000, MSBFIRST, SPI_MODE0));
-        SPI.transfer(0x30); // SRES
-        SPI.endTransaction();
-
-        // 6. Wait for MISO to go LOW again (reset finished)
-        start = millis();
-        while (digitalRead(MISO) == HIGH) {
-            if (millis() - start > 100) {
-                LOG_NEW_LINE("Timeout waiting for MISO LOW after SRES");
-                break;
-            }
-        }
-
-        // 7. Pull CSn HIGH (end transaction)
-        digitalWrite(CSN_PIN, HIGH);
-
-        // 8. Wait for crystal to stabilize (typically 10 ms)
-        delay(10);
-
-        // 9. Verify PARTNUM register
-        if (verifyChipId()) {
-            LOG_NEW_LINE("CC1101 reset successful");
-            return;
-        }
-    }
-
-    LOG_NEW_LINE("Error: CC1101 reset failed after 3 attempts");
-    */
-
-    // The following code is a more robust implementation using the SPIBus class for better abstraction and error handling.
-    
-    // Retry mechanism for reset sequence
-    // This will attempt the reset sequence up to 3 times, exiting early if successful.
-    // The reset sequence is wrapped in a lambda function to allow retries with exit conditions.
-    // The lambda captures the necessary state and performs the reset steps, logging errors as needed.
     avr_algorithms::repeat_withExitCondition(3, [&]() {
         #ifdef LOG_VERBOSE          
         LOG("Transceiver::reset() - Attempting reset sequence");
@@ -237,6 +190,14 @@ void Transceiver::reset()
         LOG_NEW_LINE("Transceiver::reset() - Starting reset sequence");
         String msg = "attempt: " + String(attempt + 1);
         LOG_DYNAMIC(msg);
+        pinMode(SCK, OUTPUT);
+        pinMode(MOSI, OUTPUT);
+        pinMode(MISO, INPUT);
+        digitalWrite(SCK, HIGH);
+        digitalWrite(MOSI, LOW);
+
+        _spi.deselectDevice();
+        delayMicroseconds(5);
 
         // Step1: Pull CSn LOW for at least 10 µs
         _spi.selectDevice();
@@ -244,48 +205,73 @@ void Transceiver::reset()
 
         // Step2: Pull CSn HIGH for at least 40 µs
         _spi.deselectDevice();
-        delayMicroseconds(40);
+        delayMicroseconds(41);
 
         // Step3: Pull CSn LOW again to start SPI transaction
         _spi.selectDevice();
 
         // Step4: Wait for MISO to go low (indicating chip is ready)
         unsigned long start = millis();
-        // Polling MISO until it goes LOW or timeout after 100 ms
+        bool readyBeforeReset = false;
         while (digitalRead(MISO) == HIGH) {
             if (millis() - start > 100) {
                 LOG_NEW_LINE("Timeout waiting for MISO LOW before SRES");
                 break; // Exit loop on timeout
             }
         }
-
-        // Step5: Send SRES command (0x30)
-        if (!strobeCommand(CC1101::Strobes::Command::SRES)) {
-            LOG_NEW_LINE("Error: Failed to send SRES command");
-            return true; // Retry
+        readyBeforeReset = (digitalRead(MISO) == LOW);
+        if (!readyBeforeReset) {
+            _spi.deselectDevice();
+            ++attempt;
+            return true;
         }
+
+        // Step5: Send SRES while CSn stays low for the whole reset transaction,
+        // using the same SPI settings as every other CC1101 access.
+        _spi.beginBus();
+        _spi.transferRaw(static_cast<uint8_t>(CC1101::Strobes::Command::SRES));
+        _spi.endBus();
 
         // Step6: Wait for MISO to go low again (indicating reset finished)
         start = millis();
+        bool readyAfterReset = false;
         while (digitalRead(MISO) == HIGH) {
             if (millis() - start > 100) {
                 LOG_NEW_LINE("Timeout waiting for MISO LOW after SRES");
                 break; // Exit loop on timeout
             }
         }
+
+        readyAfterReset = (digitalRead(MISO) == LOW);
+
+        // End the reset transaction before validating the chip ID.
+        _spi.deselectDevice();
+        if (!readyAfterReset) {
+            ++attempt;
+            return true;
+        }
+
         // Step7: Wait for the chip to stabilize (typically 10 ms)
         delay(10);
 
         // Step8: Verify PARTNUM register
         if (verifyChipId()) {
             LOG_NEW_LINE("CC1101 reset successful");
+            success = true;
             return false; // Exit on success
         }
+
+        ++attempt;
+        return true;
     }
     );
 
-    LOG_NEW_LINE("Error: CC1101 reset failed after 3 attempts");
-    LOG("\n\n");
+    if (!success) {
+        LOG_NEW_LINE("Error: CC1101 reset failed after 3 attempts");
+        LOG("\n\n");
+    }
+
+    return success;
 }
 
 
@@ -293,8 +279,8 @@ void Transceiver::reset()
 /// @return True if PARTNUM is 0x00  
 bool Transceiver::verifyChipId()
 {
-    if(ReadResult result = _spi.readRegister(0x30); result.value == 0x00) return true;
-    else return false;
+    ReadResult result = _spi.readRegister(CC1101::Address::PARTNUM);
+    return result.value == 0x00;
 }
 
 
@@ -384,8 +370,8 @@ bool Transceiver::readBackPATABLE(uint8_t* paTable)
 /// @param value 
 void Transceiver::writePATABLE()
 {
-    uint8_t index = _transceiver_config.getPATableIndex();
-   configurePATable(index);
+    uint8_t logicOnePowerByte = _transceiver_config.getOOKLogicOnePowerByte();
+    configurePATable(logicOnePowerByte);
 }
 
 
@@ -396,24 +382,38 @@ void Transceiver::writePATABLE()
 ///         - Bits 5–3: LODIV_BUF_CURRENT_TX (controls TX buffer current, often set by modulation settings like OOK/FSK).
 ///         - Bits 2–0: PA_POWER (selects PATABLE index, 0–7).
 ///
-/// @param powerlevelIndex 
-void Transceiver::configurePATable(uint8_t powerLevelIndex)
+/// @param logicOnePowerByte Selected PATABLE byte for OOK logic '1'.
+bool Transceiver::configurePATable(uint8_t logicOnePowerByte)
 {
-    // Step1: Validate index
-    if (powerLevelIndex > 7) {
-        LOG_NEW_LINE("Error: Invalid PATABLE index");
-        return;
-    }
+    const uint8_t patable[8] = {
+        OOK_LOGIC_ZERO_POWER_BYTE,
+        logicOnePowerByte,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00
+    };
 
     // Step2:  Write the entire 8-byte PATABLE using a burst write
-    writeBurstRegister(CC1101::Address::PATABLE, paTable ,8);                 //
+    if (!writeBurstRegister(CC1101::Address::PATABLE, patable ,8)) {
+        LOG_NEW_LINE("Error: Failed to write CC1101 PATABLE");
+        return false;
+    }
+
+    uint8_t powerLevelIndex = OOK_LOGIC_ONE_POWER_INDEX;
 
     // Step3:  Ensure the CC1101 uses the correct PATABLE entry Set FREND0.PA_POWER
     uint8_t frend0 = readRegister(CC1101::Address::FREND0).value;          // Reads the current value of the FREND0 register (address 0x22) and clears its PA_POWER bits (bits 2:0) while preserving other bits.
     frend0 &= ~0x07;                                                                            // Clear PA_POWER bits (bits 2:0)                                                                                  
     frend0 |= (powerLevelIndex & 0x07);                                                 // Sets the PA_POWER bits (2:0) in frend0 to the desired PATABLE index (powerLevelIndex), ensuring it’s within 0–7.   
-    writeRegister(CC1101::Value::FREND0, frend0);                                            // Writes the updated frend0 value back to the FREND0 register.  
+    if (!writeRegister(CC1101::Address::FREND0, frend0)) {
+        LOG_NEW_LINE("Error: Failed to select the CC1101 PATABLE power index");
+        return false;
+    }
     
+    return true;
 }
 
 
@@ -426,9 +426,7 @@ bool Transceiver::strobeCommand(CC1101::Strobes::Command command)
 
     avr_algorithms::repeat_withExitCondition(3, [&]() {
         // Step 1: Send strobe command
-        _spi.applyTransaction([&]() {
-            _spi.transferByte(static_cast<uint8_t>(command));
-        });
+        _spi.transferByte(static_cast<uint8_t>(command));
 
         // Step 2: Check if the chip is responsive (PARTNUM == 0x00)
         auto partnum = readRegister(CC1101::Address::PARTNUM).value;
@@ -480,18 +478,21 @@ void Transceiver::setFrequency(uint32_t frequencyHz)
     
     // Step3: Converts the desired frequency (in Hz) to a 24-bit frequency control word (freq) used by the CC1101.
     uint32_t freq = (uint64_t)frequencyHz * (1ULL << 16) / F_XOSC;                                                                              // F_carrier = (Fx_OSC/2^16)*freq (datasheet, section 12)  => freq = (F_carrier *2^16)/FxOSC. [ (1ULL << 16) computes 2^16 = 65536, using ULL for 64-bits precision]
+
+    #if LOG_VERBOSE
+    LOG_DYNAMIC("Applying carrier frequency: " + String(frequencyHz) + " Hz");
+    #endif
     
     writeRegister(CC1101::Address::FREQ2, (freq >> 16) & 0xFF);                                                                               // Extracts  (bits 23:16) to configure FREQ2
     writeRegister(CC1101::Address::FREQ1, (freq >> 8) & 0xFF);                                                                                 // Extracts  (bits 15:8) for FREQ1
     writeRegister(CC1101::Address::FREQ0, freq & 0xFF);                                                                                           // Extracts  (bits 7:0) for FREQ0
 }
 
-/// @brief Set the Power tranmission frequency
-/// @param level - PaTable index 
-void Transceiver::setPowerLevel(uint8_t level)
+/// @brief Set the transmit power bucket for the OOK logic '1' level.
+/// @param powerLevel - Semantic power selector for the low-band OOK profile.
+void Transceiver::setPowerLevel(OutputPowerLevel powerLevel)
 {
-    if (level > 7) level = 7;
-    configurePATable(level);
+    configurePATable(outputPowerLevelToOOKLogicOnePowerByte(powerLevel));
 }
 
 /// @brief Put the CC1101 module in SLEEP state

@@ -5,7 +5,7 @@
 #include "SPI/SPIBus.h"
 #include "Config/CC1101_Config/CC1101.h"
 #include "Debugging/Logging.h"
-#include "Config/CC1101_Config/CC1101_315MHZ_OOK_Config.h"
+#include "Config/CC1101_Config/CC1101_LowBand_OOK_Config.h"
 #include "utils/HelperConfigRegisters_CC1101.h"
 #include "Streamer/SC41344_FrameStreamer.h"
 
@@ -57,7 +57,7 @@ class Transceiver : public ITransceiver
         // -----------------------------------------------
         bool begin() override;                                                                               // Initialize hardware: SPI,  Apply full config passed at construction.
         void setFrequency(uint32_t frequencyHz) override;                                      // Write the frequency registers to tune which is gonna be the carrier freq. used
-        void setPowerLevel(uint8_t level) override;                                                  // Power level for the antenna  
+        void setPowerLevel(OutputPowerLevel powerLevel) override;                        // Update the OOK logic '1' power level used in PATABLE.
         void sleep() override;                                                                                // To enter in sleep Mode to save Power       
 
         template<size_t N>
@@ -75,14 +75,14 @@ class Transceiver : public ITransceiver
         // --------------------------------------------------------------
         // Helper Private function for Specific register operation  
         // --------------------------------------------------------------
-        void enableTransmitMode();                                                                       // Enables Transmit Mode Tx for the CC1101 to transmit data    
+        bool enableTransmitMode();                                                                       // Enables Transmit Mode Tx for the CC1101 to transmit data    
         bool writeRegister(uint8_t address , uint8_t value);                                        // Write a single register of the CC1101      
         bool writeBurstRegister(uint8_t address , const uint8_t* data, size_t leng);       // Write multiplebytes at once       
-        void writePATABLE();                                                                                    // Load the PATABLE register that can hold up to eight user selected output power settings.
-        void configurePATable(uint8_t powerlevelIndex);                                           // Configures the PATABLE for a specific power level transmission.   
+        void writePATABLE();                                                                                    // Load the PATABLE register for asynchronous OOK logic 0 / logic 1 levels.
+        bool configurePATable(uint8_t logicOnePowerByte);                                     // Configures the PATABLE for asynchronous OOK transmission.   
 
         bool strobeCommand(CC1101::Strobes::Command command);                     // These commands are used to disable the crystal oscillator, enable receive mode, enable wake-on-radio etc
-        void reset();                                                                                              // Apply full reset sequence.
+        bool reset();                                                                                              // Apply full reset sequence.
         bool verifyChipId();                                                                                    // Check if the PARTNUM is 0x00 at it should be after reset
 };
 
@@ -90,8 +90,8 @@ class Transceiver : public ITransceiver
 /**
  * @brief Stream a data frame using the SC41344 protocol via the provided encoder.
  * 
- * This function ensures the radio is in TX mode, sends the data using the
- * SC41344 frame format, and returns the chip to IDLE.
+ * This function sends the data as multiple distinct RF bursts. Each burst
+ * enters TX, emits one SC41344 frame, and then returns the chip to IDLE.
  * 
  * @tparam N Length of the frame array (number of bits).
  * @param code_DataBits Bit array representing the logical message.
@@ -104,30 +104,31 @@ inline bool Transceiver::transmitFrame(const uint8_t (&code_DataBits)[N], IBitEn
     // Alias to access strobes commands
     using Strobe = CC1101::Strobes::Command;
 
-    // Ensure TX mode
-    enableTransmitMode();
-
-    /*
-    // Check if the chip is in TX mode
-    LOG_NEW_LINE("Checking if CC1101 is in TX mode...");
-    if (readRegister(CC1101::Address::MARCSTATE).value != 0x13) {
-        LOG_NEW_LINE("Error: Not in TX mode.");
-        return false;
-    }
-    */
-   
-    // Stream Frame
     LOG_NEW_LINE("Streaming frame to CC1101...");
-    // Create a FrameStreamer instance for the SC41344 protocol 
-    // and stream the data bits using the provided encoder
-    // This will handle the encoding and timing of the bits
     SC41344_FrameStreamer<N> streamer(*this);
-    streamer.streamFrame(code_DataBits, encoder);
 
-    // Return to IDLE
-    if (!strobeCommand(Strobe::SIDLE)) { 
-        LOG_NEW_LINE("Error: Failed to return to IDLE mode");
-        return false;
+    encoder.setIdle();
+
+    for (uint8_t transmissionIndex = 0; transmissionIndex < FRAME_TRANSMISSION_COUNT; ++transmissionIndex) {
+        if (transmissionIndex > 0) {
+            encoder.sendSilence();
+        }
+
+        if (!enableTransmitMode()) {
+            LOG_NEW_LINE("Error: Failed to prepare the CC1101 for TX");
+            encoder.setIdle();
+            return false;
+        }
+
+        streamer.streamFrameOnceStatic(code_DataBits, encoder, transmissionIndex == 0);
+
+        if (!strobeCommand(Strobe::SIDLE)) {
+            LOG_NEW_LINE("Error: Failed to return to IDLE mode");
+            encoder.setIdle();
+            return false;
+        }
     }
+
+    encoder.setIdle();
     return true;
 }

@@ -57,9 +57,10 @@ private:
     uint8_t   _pin_ID;                                     // arbitrary ID (unused in zero‐arg callback)
     uint8_t   _pin;                                         // the Arduino pin number
     bool      _isActiveLow;                            // if true, LOW means “pressed”
-    bool      _debouncing;                           // true while we’re in a press/release cycle
-    bool      _stableState;                            // last confirmed stable state (true=pressed)
-    bool      _pressedDetected;                   // set true once we have fired the press callback
+    volatile bool _debouncing;                      // true while we’re in a press/release cycle
+    volatile bool _stableState;                     // last confirmed stable state (true=pressed)
+    volatile bool _pressedDetected;                 // set true once we have fired the press callback
+    volatile bool _startRequested;                  // ISR-safe flag requesting a new debounce session
     bool      _buffer[BUFFER_SIZE];               // circular buffer of last BUFFER_SIZE samples
     size_t    _head;                                      // index of next slot to overwrite
     uint8_t   _thresholdPercentage;               // e.g. 60 means 60% of BUFFER_SIZE
@@ -70,4 +71,5 @@ private:
 
     // Zero out the buffer and reset head to 0
     void clearBuffer();
+    void beginDebounceSession();
 };

@@ -2,7 +2,18 @@
 
 
 
-TransceiverConfig::TransceiverConfig(uint32_t transmissionFreqBand_Hz, ModulationScheme modulation, OutputPowerLevels powerLevel):
+uint8_t outputPowerLevelToOOKLogicOnePowerByte(OutputPowerLevel powerLevel)
+{
+    switch (powerLevel)
+    {
+        case OutputPowerLevel::LOW_POWER: return LOW_BAND_OOK_LOGIC_ONE_POWER_LOW;
+        case OutputPowerLevel::MEDIUM_POWER: return LOW_BAND_OOK_LOGIC_ONE_POWER_MEDIUM;
+        case OutputPowerLevel::HIGH_POWER: return LOW_BAND_OOK_LOGIC_ONE_POWER_HIGH;
+        default: return LOW_BAND_OOK_LOGIC_ONE_POWER_HIGH;
+    }
+}
+
+TransceiverConfig::TransceiverConfig(uint32_t transmissionFreqBand_Hz, ModulationScheme modulation, OutputPowerLevel powerLevel):
 _transmission_frequency_Hz(transmissionFreqBand_Hz),
 _modulationScheme(modulation),
 _powerLevel(powerLevel)
@@ -19,20 +30,14 @@ ModulationScheme TransceiverConfig::getModulationScheme() const
     return _modulationScheme;
 }
 
-OutputPowerLevels TransceiverConfig::getPowerLevel() const
+OutputPowerLevel TransceiverConfig::getPowerLevel() const
 {
     return _powerLevel;
 }
 
-/// @brief 
-/// @return 
-uint8_t TransceiverConfig::getPATableIndex() const
+/// @brief Returns the low-band PATABLE byte to use for OOK logic '1'.
+/// @return PATABLE entry value for the selected output power level.
+uint8_t TransceiverConfig::getOOKLogicOnePowerByte() const
 {
-    switch (_powerLevel)
-    {
-        case OutputPowerLevels::LOW_POWER : return PATABLE_LOW_INDEX; break;
-        case OutputPowerLevels::MEDIUM_POWER : return PATABLE_MEDIUM_INDEX; break;
-        case OutputPowerLevels::HIGH_POWER : return PATABLE_HIGH_INDEX; break; 
-        default: return 0;  break;                                                                                                  // Fallbak to highest power
-    }
+    return outputPowerLevelToOOKLogicOnePowerByte(_powerLevel);
 }

@@ -27,41 +27,53 @@ bool applyRegisterConfig_CC1101(const RegisterSettings* config, size_t N, Write&
         uint8_t address = StoragePolicy::read(&regSettings.reg);
         uint8_t value = StoragePolicy::read(&regSettings.reg_value);
         bool verify = StoragePolicy::read(&regSettings.verify);
+        String registerLabel = String(CC1101::registerName(address)) + String(F(" (")) + formatHex8(address) + ')';
 
-        // Log every successful register write (for trace)
         #ifdef LOG_VERBOSE
-        LOG("---- Register Write OK ----");
-        LOG("Wrote Register:");
-        LOG_PAIR_HEX("- Address:", address);
-        LOG_PAIR_HEX("- Value:", value);
+        String beginMsg = String(F("[CC1101][CFG] Apply ")) + registerLabel + String(F(" = ")) + formatHex8(value);
+        if (verify) {
+            beginMsg += F(" [verify]");
+        }
+        LOG_DYNAMIC(beginMsg);
         #endif
 
         // Step 2: Write configuration and check for operation success
         if (!writeRegister(address, value)) {
-            // Log configuration error
-            LOG("---- Register Config Failure ----");
-            LOG("Error: Writing operation failed for Register configuration: ");
-            LOG_PAIR_HEX("- Address: ", address);
-            LOG_PAIR_HEX("- Value:", value);
+            LOG_DYNAMIC(String(F("[CC1101][CFG][ERROR] Write failed for ")) + registerLabel +
+                        String(F(", target value ")) + formatHex8(value));
             return false;
         }
 
         // Step 3: Verify if the register was written correctly
         if (verify) {
-            if (auto writeValue = readRegister(address); writeValue != value) {
-                // Log verification error
-                LOG("---- Register Config Failure ----");
-                LOG("Error: Fail when trying to read CC1101 register:");
-                LOG_PAIR_HEX("- Address: ", address);
-                LOG_PAIR_HEX("- Expected: ", value);
-                LOG_PAIR_HEX("- Readback: ", writeValue);
+            uint8_t attempts = 0;
+            bool verified = false;
+
+            avr_algorithms::repeat_withExitCondition(3, [&]() {
+                delayMicroseconds(50);
+                uint8_t writeValue = readRegister(address);
+                if (writeValue == value) {
+                    verified = true;
+                    return false;
+                }
+
+                LOG_DYNAMIC(String(F("[CC1101][CFG][VERIFY-RETRY ")) + String(attempts + 1) +
+                            F("/3] ") + registerLabel +
+                            String(F(": expected ")) + formatHex8(value) +
+                            String(F(", read ")) + formatHex8(writeValue));
+                attempts++;
+                return true;
+            });
+
+            if (!verified) {
+                LOG_DYNAMIC(String(F("[CC1101][CFG][ERROR] Verify failed for ")) + registerLabel +
+                            String(F(" after 3 attempts, expected ")) + formatHex8(value));
                 return false;
             }
         }
         return true; // Success
     };
 
-     avr_algorithms::for_each_element(config, N, writeAndVerifyRegister); // Use pointer-based for_each
-     return true; // All registers written and verified successfully
+     return avr_algorithms::for_each_until(config, N, writeAndVerifyRegister);
 }
 

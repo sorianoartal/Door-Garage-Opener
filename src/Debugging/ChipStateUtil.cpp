@@ -9,7 +9,7 @@ String chipStateToString(uint8_t chipState)
    
     String stateStr ;
 
-    switch ( (chipState >> 4) & 0x0F ) {
+    switch (chipState & 0x0F) {
         case 0x00: stateStr = "IDLE"; break;
         case 0x01: stateStr = "RX"; break;
         case 0x02: stateStr = "TX"; break;

@@ -13,8 +13,8 @@ namespace bitFlags  = SPI_MASK::Masks;
 /// @note This structure is used to encapsulate the result of a register read operation from the
 /// CC1101 transceiver. It contains a status byte and a value byte, allowing for easy checking of the read operation's success.
 /// @note The status byte indicates the state of the CC1101 chip, while the value byte contains the actual value of the specified register.
-/// @note The status byte is expected to be 0xFF if the read operation was not successful, and the value byte is also expected to be 0xFF in that case.
-/// @note The 'isValid()' function checks if both the status and value are not 0xFF, indicating a successful read operation.
+/// @note A floating or failed SPI read often returns a status byte of 0xFF.
+/// @note The 'isValid()' function therefore validates the status byte and allows 0xFF as a legitimate register value.
 /// @struct ReadResult
 struct ReadResult {
     public:
@@ -24,7 +24,7 @@ struct ReadResult {
 
     // Helper function to check if the read operation was successful    
     bool isValid() const {
-        return status != 0xFF && value != 0xFF; // Check if both status and value are not 0xFF
+        return status != 0xFF;
     }
     
     uint8_t status;             // Status byte returned
@@ -97,19 +97,23 @@ class SPIBus
 
         void begin();                                                                                               // Initialization of SPI config.
         void end();                                                                                                  // Disables the SPI bus (leaving pin modes unchanged).
+        void beginBus();                                                                                             // Begin an SPI transaction using the configured bus settings
+        void endBus();                                                                                               // End the current SPI transaction
         void selectDevice();                                                                                      // Toggle CSn pin LOW to start a transaction.   
         void deselectDevice();                                                                                  // Toggle CSn pin HGH to end a transaction.   
         uint8_t transferByte( uint8_t data);                                                                 // Single-byte transmission
+        uint8_t transferRaw(uint8_t data);                                                                     // Transfer a byte without toggling CSn or SPI transaction state
         bool writeBurstRegister(uint8_t address,const uint8_t* data , size_t length);      // Burst write operation for transfer multiple byte at once
         bool readBurstRegister(uint8_t address, uint8_t* buffer, size_t length);            // Burst read
         bool writeRegister(uint8_t address , uint8_t value);                                        // Write a single register
         ReadResult readRegister(uint8_t address);                                                   // Read a single register   
 
         template<typename Func>
-        inline void applyTransaction( Func&& operation);
+        inline bool applyTransaction( Func&& operation);
 
     private:
 
+        bool waitUntilReady(uint16_t timeoutUs = 10000) const;                                  // Wait until the CC1101 drives SO/MISO low after CSn is asserted
         bool validateParameters(uint8_t address, const uint8_t* buffer, size_t length) const;   // Validate parameters for burst read/write operations
         bool performBurstRead(uint8_t address, uint8_t* buffer, size_t length);                     // Perform burst read operation
 
@@ -122,11 +126,19 @@ class SPIBus
 /// @tparam Func - Type of the operation that we need for 
 /// @param operation 
 template <typename Func>
-inline void SPIBus::applyTransaction(Func &&operation)
+inline bool SPIBus::applyTransaction(Func &&operation)
 {
-    SPI.beginTransaction(_settings);             // To begin using the SPI port. The SPI port will be configured our settings. The simplest and most efficient way to use SPISettings is directly inside SPI.beginTransaction()
+    beginBus();                                       // Apply the configured SPI bus settings for this access
     selectDevice();                                     // Write the CSn LOW to prepare the device for the transition
-    operation();                                        //  This will be the type of  transaction  function to apply
+
+    if (!waitUntilReady()) {
+        deselectDevice();
+        endBus();
+        return false;
+    }
+
+    operation();                                        // Keep the generic transaction framing simple while debugging SPI timing
     deselectDevice();                                 // write the CSn HIGH to disable the device 
-    SPI.endTransaction();                           // End using SPI port after finish   
+    endBus();                                           // End using SPI port after finish
+    return true;
 };

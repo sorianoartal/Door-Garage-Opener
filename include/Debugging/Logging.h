@@ -8,10 +8,25 @@
    #define LOG_PAIR_HEX(name, val) do { Serial.print(F(name ": 0x")); Serial.println(val, HEX); } while(0)
    #define LOG_PAIR_BIN(name, val) do { Serial.print(F(name ": 0b")); Serial.println(val, BIN); } while(0)
    #define NEW_LINE() do { Serial.println(); } while(0)
+
+   inline String formatHex8(uint8_t value) {
+      String text(F("0x"));
+      if (value < 0x10) {
+         text += '0';
+      }
+      text += String(value, HEX);
+      text.toUpperCase();
+      return text;
+   }
 #else
    #define LOG(message)
    #define LOG_NEW_LINE(message)
    #define LOG_DYNAMIC(message)
    #define LOG_PAIR_DEC(name, val)
    #define LOG_PAIR_HEX(name, val)
+
+   inline String formatHex8(uint8_t value) {
+      (void)value;
+      return String();
+   }
 #endif
